@@ -1,0 +1,9 @@
+httpx>=0.27.0
+fastapi>=0.116.0
+psycopg[binary]>=3.2.1
+PyYAML>=6.0.1
+python-json-logger>=2.0.7
+pytest>=8.1.1
+uvicorn>=0.35.0
+requests>=2.31.0
+mp_api>=0.41.1

@@ -1,0 +1,12 @@
+{
+  "run_id": "20260318T120136Z",
+  "input_path": "assests\\material_formulas.txt",
+  "total_formulas": 5,
+  "succeeded": 0,
+  "missing": 0,
+  "failed": 5,
+  "output_dir": "C:\\Users\\karti\\OneDrive\\Documents\\Automation\\Database\\data\\raw\\materials_project\\json\\20260318T120136Z",
+  "manifest_path": "C:\\Users\\karti\\OneDrive\\Documents\\Automation\\Database\\data\\raw\\materials_project\\manifests\\20260318T120136Z.jsonl",
+  "summary_path": "C:\\Users\\karti\\OneDrive\\Documents\\Automation\\Database\\data\\raw\\materials_project\\manifests\\20260318T120136Z_summary.json",
+  "completed_at": "2026-03-18T12:01:39Z"
+}

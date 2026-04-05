@@ -1,0 +1,6 @@
+deepxde
+torch
+duckdb
+pyarrow
+pandas
+numpy
