@@ -1,0 +1,45 @@
+--- 1. VERIFY DATA SOURCE ---
+Loaded dataset path: D:\ai_ml_internship\data\dataset.parquet
+First 5 rows:
+        time         x  temperature  ...   quantity  reaction_rate  survival_rate
+0  0.374540  0.185133     0.377751  ...  96.323871   1.820542e+05       0.261706
+1  0.950714  0.541901     0.383121  ...  90.930798   2.448933e+06       0.246979
+2  0.731994  0.872946     0.186915  ...  92.941549   1.003519e+06       0.906255
+3  0.598658  0.732225     0.409672  ...  94.189088   5.523601e+05       0.249546
+4  0.156019  0.806561     0.488503  ...  98.451921   5.300295e+04       0.271950
+
+[5 rows x 8 columns]
+
+--- 2. INSPECT SURVIVAL COLUMN ---
+count    1000.000000
+mean        0.502406
+std         0.290674
+min         0.000012
+25%         0.261351
+50%         0.500614
+75%         0.759104
+max         0.997821
+Name: survival_rate, dtype: float64
+
+Correlation:
+                temperature      time  survival_rate
+temperature       1.000000 -0.460049      -0.017616
+time             -0.460049  1.000000       0.014518
+survival_rate    -0.017616  0.014518       1.000000
+
+--- 3. VISUAL CHECK ---
+Saved plots to outputs/temp_vs_survival_before.png and outputs/time_vs_survival_before.png
+
+--- 5. FIX (REPLACING RANDOM DATA) ---
+Saved updated dataset.parquet
+
+--- 6. VERIFY AGAIN ---
+New Correlation:
+                temperature      time  survival_rate
+temperature       1.000000 -0.460049      -0.693547
+time             -0.460049  1.000000       0.958712
+survival_rate    -0.693547  0.958712       1.000000
+
+--- 7. FINAL CHECK (SURROGATE MODEL) ---
+Training surrogate model for 300 epochs...
+Final MSE: 0.000013, Surrogate Accuracy (R^2): 0.9900
