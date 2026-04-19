@@ -1,7 +1,8 @@
 """
 Module: surrogate_trainer.py
-Purpose: Replace the slow PINN at inference time with a fast, lightweight PyTorch model.
-         Trains ONLY on real data - NO DUMMY DATA ALLOWED.
+Purpose: Lightweight PyTorch surrogate that replaces the PINN at inference time.
+         Trained exclusively on real data from universal_index.parquet.
+         NO DUMMY DATA ALLOWED.
 """
 import torch
 import torch.nn as nn
@@ -12,16 +13,18 @@ import logging
 import os
 import sys
 
-# Add parent directory to path for imports
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
 
-from pinn_system.data_loader import load_data
+from pinn_system.data_loader import load_data, PARQUET_PATH, MODEL_COLUMNS
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
+
+# ── Surrogate Architecture ─────────────────────────────────────────────────────
 class SurrogateMLP(nn.Module):
-    def __init__(self, inputs=2, outputs=1, hidden_layers=3, neurons_per_layer=64):
-        super(SurrogateMLP, self).__init__()
+    def __init__(self, inputs: int = 2, outputs: int = 1,
+                 hidden_layers: int = 3, neurons_per_layer: int = 64):
+        super().__init__()
         layers = []
         in_dim = inputs
         for _ in range(hidden_layers):
@@ -31,155 +34,161 @@ class SurrogateMLP(nn.Module):
         layers.append(nn.Linear(in_dim, outputs))
         self.net = nn.Sequential(*layers)
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.net(x)
 
-def train_surrogate(X_train: np.ndarray, y_train: np.ndarray, epochs=1000, batch_size=256, lr=0.001):
+
+# ── Training ───────────────────────────────────────────────────────────────────
+def train_surrogate(
+    X_train: np.ndarray,
+    y_train: np.ndarray,
+    epochs: int = 1000,
+    batch_size: int = 256,
+    lr: float = 0.001,
+    save_path: str = None,
+) -> SurrogateMLP:
     """
-    Trains a lightweight PyTorch surrogate model on real physics data.
-    
+    Train a lightweight surrogate on real physics data.
+
     Args:
-        X_train: Real input features (temperature, time, etc.)
-        y_train: Real target values (survival_rate from physics formula or PINN predictions)
-        epochs: Number of training epochs
-        batch_size: Batch size for training
-        lr: Learning rate
-        
+        X_train    : Feature matrix (float32, shape [N, F]).
+        y_train    : Target vector  (float32, shape [N, 1]).
+        epochs     : Training epochs.
+        batch_size : Mini-batch size.
+        lr         : Learning rate.
+        save_path  : Where to save the .pth file (defaults to surrogate/ dir).
+
     Returns:
-        Trained model
+        Trained SurrogateMLP model.
     """
-    # Validate inputs - NO DUMMY DATA
-    assert X_train.shape[0] > 0, "❌ X_train is empty"
-    assert y_train.shape[0] > 0, "❌ y_train is empty"
-    assert X_train.shape[0] == y_train.shape[0], "❌ X and y have different lengths"
-    assert not np.isnan(X_train).any(), "❌ X_train contains NaN"
-    assert not np.isnan(y_train).any(), "❌ y_train contains NaN"
-    assert y_train.std() > 0.01, f"❌ y_train variance too low: {y_train.std()}"
-    
-    logging.info("✅ Input validation passed")
-    logging.info(f"Training data: X={X_train.shape}, y={y_train.shape}")
-    logging.info(f"Target stats: mean={y_train.mean():.4f}, std={y_train.std():.4f}, min={y_train.min():.4f}, max={y_train.max():.4f}")
-    
-    logging.info("Initializing Surrogate Model...")
-    inputs = X_train.shape[1]
-    outputs = y_train.shape[1]
-    model = SurrogateMLP(inputs=inputs, outputs=outputs)
-    
+    # ── Validation firewall ────────────────────────────────────────────
+    assert X_train.shape[0] > 0,                          "X_train is empty"
+    assert y_train.shape[0] > 0,                          "y_train is empty"
+    assert X_train.shape[0] == y_train.shape[0],          "X and y length mismatch"
+    assert not np.isnan(X_train).any(),                   "X_train contains NaN"
+    assert not np.isnan(y_train).any(),                   "y_train contains NaN"
+    assert y_train.std() > 0.01, (
+        f"y_train variance too low: std={y_train.std():.4e}. "
+        "Check universal_index.parquet for degenerate columns."
+    )
+
+    logging.info("Input validation passed ✅")
+    logging.info(f"Training data — X={X_train.shape}, y={y_train.shape}")
+    logging.info(
+        f"Target stats — mean={y_train.mean():.4f}, std={y_train.std():.4f}, "
+        f"min={y_train.min():.4f}, max={y_train.max():.4f}"
+    )
+
+    # ── Build model ────────────────────────────────────────────────────
+    model     = SurrogateMLP(inputs=X_train.shape[1], outputs=y_train.shape[1])
     criterion = nn.MSELoss()
     optimizer = optim.Adam(model.parameters(), lr=lr)
 
-    X_tensor = torch.tensor(X_train, dtype=torch.float32)
-    y_tensor = torch.tensor(y_train, dtype=torch.float32)
-    
-    dataset = torch.utils.data.TensorDataset(X_tensor, y_tensor)
-    dataloader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    X_tensor  = torch.tensor(X_train, dtype=torch.float32)
+    y_tensor  = torch.tensor(y_train, dtype=torch.float32)
+    dataset   = torch.utils.data.TensorDataset(X_tensor, y_tensor)
+    loader    = torch.utils.data.DataLoader(
+        dataset, batch_size=batch_size, shuffle=True
+    )
 
+    # ── Training loop ──────────────────────────────────────────────────
     start_time = time.time()
-    best_loss = float('inf')
-    
+    best_loss  = float('inf')
+
     for epoch in range(epochs):
-        epoch_loss = 0.0
         model.train()
-        for batch_X, batch_y in dataloader:
+        epoch_loss = 0.0
+        for batch_X, batch_y in loader:
             optimizer.zero_grad()
             preds = model(batch_X)
-            loss = criterion(preds, batch_y)
+            loss  = criterion(preds, batch_y)
             loss.backward()
             optimizer.step()
             epoch_loss += loss.item()
-        
-        avg_loss = epoch_loss / len(dataloader)
+
+        avg_loss = epoch_loss / len(loader)
         if avg_loss < best_loss:
             best_loss = avg_loss
-            
-        if (epoch + 1) % 100 == 0:
-            logging.info(f"Epoch [{epoch+1}/{epochs}], Loss: {avg_loss:.6f}, Best: {best_loss:.6f}")
 
-    train_time = time.time() - start_time
-    logging.info(f"✅ Surrogate training completed in {train_time:.2f} seconds.")
-    
-    # Evaluate model accuracy
+        if (epoch + 1) % 100 == 0:
+            logging.info(
+                f"Epoch [{epoch+1}/{epochs}]  loss={avg_loss:.6f}  best={best_loss:.6f}"
+            )
+
+    logging.info(
+        f"Training complete in {time.time() - start_time:.2f}s  "
+        f"best_loss={best_loss:.6f} ✅"
+    )
+
+    # ── Evaluation ─────────────────────────────────────────────────────
     model.eval()
     with torch.no_grad():
         all_preds = model(X_tensor).numpy()
-        mse = np.mean((all_preds - y_train) ** 2)
-        mae = np.mean(np.abs(all_preds - y_train))
-        # Calculate R² score
-        ss_res = np.sum((y_train - all_preds) ** 2)
-        ss_tot = np.sum((y_train - y_train.mean()) ** 2)
-        r2 = 1 - (ss_res / ss_tot)
-        accuracy = r2 * 100  # Convert to percentage
-        
-        logging.info(f"✅ Model Performance:")
-        logging.info(f"   MSE: {mse:.6f}")
-        logging.info(f"   MAE: {mae:.6f}")
-        logging.info(f"   R² Score: {r2:.4f}")
-        logging.info(f"   Accuracy: {accuracy:.2f}%")
-        
-        if accuracy < 90:
-            logging.warning(f"⚠️  Accuracy {accuracy:.2f}% is below target 90%")
+        mse       = np.mean((all_preds - y_train) ** 2)
+        mae       = np.mean(np.abs(all_preds - y_train))
+        ss_res    = np.sum((y_train - all_preds) ** 2)
+        ss_tot    = np.sum((y_train - y_train.mean()) ** 2)
+        r2        = 1.0 - (ss_res / (ss_tot + 1e-12))
+
+        logging.info(f"Performance — MSE={mse:.6f}  MAE={mae:.6f}  R²={r2:.4f}  ({r2*100:.2f}%)")
+        if r2 * 100 < 90:
+            logging.warning(f"R²={r2*100:.2f}% is below 90% target.")
         else:
-            logging.info(f"✅ Accuracy {accuracy:.2f}% meets target!")
-        
-        # Test inference speed
-        test_sample = X_tensor[:1]
-        t0 = time.time()
-        _ = model(test_sample)
-        inf_time = time.time() - t0
-        logging.info(f"Surrogate inference time per sample: {inf_time:.6f} seconds")
-        
-    save_path = os.path.join(os.path.dirname(__file__), "surrogate_model.pth")
+            logging.info(f"R²={r2*100:.2f}% meets target ✅")
+
+        # Inference speed
+        t0  = time.time()
+        _   = model(X_tensor[:1])
+        logging.info(f"Inference per sample: {time.time()-t0:.6f}s")
+
+    # ── Save ───────────────────────────────────────────────────────────
+    if save_path is None:
+        save_path = os.path.join(os.path.dirname(__file__), "surrogate_model.pth")
     torch.save(model, save_path)
-    logging.info(f"✅ Model saved to {save_path}")
+    logging.info(f"Model saved → {save_path}")
     return model
 
+
+# ── CLI entry-point ────────────────────────────────────────────────────────────
 def main():
-    """
-    Main function to train surrogate model using REAL data from dataset.parquet
-    """
     import argparse
-    parser = argparse.ArgumentParser(description="Train surrogate model on real physics data")
-    parser.add_argument('--data', type=str, default='data/dataset.parquet', help='Path to dataset')
-    parser.add_argument('--epochs', type=int, default=1000, help='Number of training epochs')
-    parser.add_argument('--batch_size', type=int, default=256, help='Batch size')
-    parser.add_argument('--lr', type=float, default=0.001, help='Learning rate')
+
+    parser = argparse.ArgumentParser(
+        description="Train surrogate on universal_index.parquet"
+    )
+    parser.add_argument(
+        '--model',
+        type=str,
+        default='heat',
+        choices=list(MODEL_COLUMNS.keys()),
+        help=f"Which physics model's column set to use: {list(MODEL_COLUMNS.keys())}",
+    )
+    parser.add_argument('--epochs',     type=int,   default=1000)
+    parser.add_argument('--batch_size', type=int,   default=256)
+    parser.add_argument('--lr',         type=float, default=0.001)
     args = parser.parse_args()
-    
-    logging.info("="*60)
-    logging.info("SURROGATE MODEL TRAINING - REAL DATA ONLY")
-    logging.info("="*60)
-    
-    # Load real data
-    try:
-        # Get absolute path
-        if not os.path.isabs(args.data):
-            script_dir = os.path.dirname(os.path.abspath(__file__))
-            project_root = os.path.dirname(os.path.dirname(script_dir))
-            data_path = os.path.join(project_root, args.data)
-        else:
-            data_path = args.data
-            
-        logging.info(f"Loading data from: {data_path}")
-        
-        # Load features and target
-        expected_cols = ["time", "x", "temperature", "survival_rate"]
-        X, y = load_data(data_path, expected_cols)
-        
-        logging.info(f"✅ Loaded real data: X={X.shape}, y={y.shape}")
-        
-    except Exception as e:
-        logging.error(f"❌ Failed to load data: {e}")
-        logging.error("❌ CANNOT PROCEED - NO DUMMY DATA ALLOWED")
-        raise
-    
-    # Train surrogate model
-    model = train_surrogate(X, y, epochs=args.epochs, batch_size=args.batch_size, lr=args.lr)
-    
-    logging.info("="*60)
+
+    logging.info("=" * 60)
+    logging.info("SURROGATE MODEL TRAINING — universal_index.parquet")
+    logging.info(f"Model  : {args.model.upper()}")
+    logging.info(f"Source : {PARQUET_PATH}")
+    logging.info(f"Cols   : {MODEL_COLUMNS[args.model]}")
+    logging.info("=" * 60)
+
+    X, y = load_data(model_name=args.model)
+    logging.info(f"Data loaded — X={X.shape}, y={y.shape}")
+
+    save_dir  = os.path.dirname(os.path.abspath(__file__))
+    save_path = os.path.join(save_dir, f"surrogate_{args.model}.pth")
+
+    train_surrogate(X, y, epochs=args.epochs,
+                    batch_size=args.batch_size, lr=args.lr,
+                    save_path=save_path)
+
+    logging.info("=" * 60)
     logging.info("✅ SURROGATE TRAINING COMPLETE")
-    logging.info("="*60)
-    
-    return model
+    logging.info("=" * 60)
+
 
 if __name__ == "__main__":
     main()

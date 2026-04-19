@@ -1,48 +1,87 @@
+"""
+Module: growth_model.py
+Purpose: PINN for logistic-growth surrogate.
+         ODE  : dP/dt - r*P*(1 - P/K) = 0
+         Data : universal_index.parquet
+         Cols : inputs=[temperature_max(norm), ph(norm)], target=salinity(norm)
+         All variables normalised to [0, 1]; t-axis = temperature_max, P-axis = salinity.
+"""
 import deepxde as dde
+import numpy as np
 import os
 import sys
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
 from pinn_system.base_pinn_framework import BasePINNFramework
 
+
 class GrowthModel(BasePINNFramework):
-    def __init__(self, T=10.0, P0=100.0):
+    """
+    Logistic-growth PINN trained on salinity from universal_index.parquet.
+
+    In the normalised [0,1] domain:
+        x[:, 0] ← temperature_max (norm) — pseudo time axis (t)
+        x[:, 1] ← ph              (norm) — growth-rate proxy (r)
+    Output:
+        P        ← salinity (norm)
+    Physics: dP/dt = r * P * (1 - P)   [K=1 in normalised space]
+    """
+
+    def __init__(self, P0: float = 0.1):
+        """
+        Args:
+            P0: Initial condition value in normalised space (default 0.1).
+        """
         super().__init__()
-        self.T = T
         self.P0 = P0
 
+    # ------------------------------------------------------------------
     def setup_model(self):
-        # Inputs: t, r, K
-        geom = dde.geometry.Hypercube([0, 0.1, 500], [self.T, 0.5, 2000])
+        self.setup_model_with_anchors()
+
+    def setup_model_with_anchors(self, X_observed=None, y_observed=None):
+        # ── Domain: [0,1]² ────────────────────────────────────────────
+        geom = dde.geometry.Rectangle([0.0, 0.0], [1.0, 1.0])
         self.define_domain(geom)
 
-        def ode(inputs, outputs):
-            t = inputs[:, 0:1]
-            r = inputs[:, 1:2]
-            K = inputs[:, 2:3]
-            P = outputs[:, 0:1]
-            
-            dP_dt = dde.grad.jacobian(outputs, inputs, i=0, j=0)
-            return dP_dt - r * P * (1.0 - P / K)
+        # ── ODE residual: dP/dt - r*P*(1-P) = 0 ──────────────────────
+        def ode(x, u):
+            r    = x[:, 1:2]          # ph proxy → growth rate
+            P    = u[:, 0:1]
+            dP_dt = dde.grad.jacobian(u, x, i=0, j=0)
+            return dP_dt - r * P * (1.0 - P)
 
-        def boundary_l(inputs, on_boundary):
-            return on_boundary and dde.utils.isclose(inputs[0], 0)
+        # ── IC: P(t=0) = P0 ───────────────────────────────────────────
+        def on_t0(x, on_boundary):
+            return on_boundary and dde.utils.isclose(x[0], 0.0)
 
-        ic = dde.icbc.IC(geom, lambda _: self.P0, boundary_l)
+        ic = dde.icbc.DirichletBC(geom, lambda x: self.P0, on_t0)
 
-        self.build_network(inputs=3, outputs=1)
-        
+        bcs = [ic]
+        if X_observed is not None and y_observed is not None:
+            observe_y = dde.icbc.PointSetBC(X_observed, y_observed, component=0)
+            bcs.append(observe_y)
+
+        # ── Network & model ───────────────────────────────────────────
+        self.build_network(inputs=2, outputs=1)
         data = dde.data.PDE(
             geom,
             ode,
-            [ic],
-            num_domain=250,
-            num_boundary=32,
+            bcs,
+            num_domain=1000,
+            num_boundary=100,
+            anchors=X_observed if X_observed is not None else None,
         )
         self.model = dde.Model(data, self.net)
 
+
 if __name__ == "__main__":
+    from pinn_system.data_loader import load_data
+
+    X, y = load_data(model_name="growth")
+    print(f"GrowthModel smoke test — X={X.shape}, y={y.shape}")
     gm = GrowthModel()
-    gm.setup_model()
+    gm.setup_model_with_anchors(X, y)
     gm.compile()
     gm.train(10)
+    print("GrowthModel OK.")

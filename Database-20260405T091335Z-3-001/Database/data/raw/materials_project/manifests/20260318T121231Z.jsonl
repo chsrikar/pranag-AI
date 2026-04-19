@@ -1,5 +1,0 @@
-{"formula": "LiFePO4", "status": "failed", "record_count": 0, "output_path": null, "error": "Object of type datetime is not JSON serializable", "started_at": "2026-03-18T12:12:31Z", "completed_at": "2026-03-18T12:12:35Z"}
-{"formula": "LiCoO2", "status": "failed", "record_count": 0, "output_path": null, "error": "Object of type datetime is not JSON serializable", "started_at": "2026-03-18T12:12:35Z", "completed_at": "2026-03-18T12:12:36Z"}
-{"formula": "ZnO", "status": "failed", "record_count": 0, "output_path": null, "error": "Object of type datetime is not JSON serializable", "started_at": "2026-03-18T12:12:36Z", "completed_at": "2026-03-18T12:12:37Z"}
-{"formula": "Fe2O3", "status": "failed", "record_count": 0, "output_path": null, "error": "Object of type datetime is not JSON serializable", "started_at": "2026-03-18T12:12:37Z", "completed_at": "2026-03-18T12:12:39Z"}
-{"formula": "SiC", "status": "failed", "record_count": 0, "output_path": null, "error": "Object of type datetime is not JSON serializable", "started_at": "2026-03-18T12:12:39Z", "completed_at": "2026-03-18T12:12:40Z"}
