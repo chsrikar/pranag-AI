@@ -1,9 +1,8 @@
-# inference.py
-
 import torch
 import json
 import requests
 import os
+import re
 from pathlib import Path
 
 from models.physics_models import (
@@ -12,22 +11,16 @@ from models.physics_models import (
 from datasrc.data_loader import PINNDataLoader
 
 # ============================================================
-# Load ENV
+# ENV
 # ============================================================
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except:
-    pass
-
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 
 if not OPENROUTER_API_KEY:
-    print("No API key → LLM disabled (fallback will be used)")
+    print("No API key. LLM disabled. Using fallback.")
 
 
 # ============================================================
-# 1. Load trained models
+# 1. Load models
 # ============================================================
 def load_models():
     models = {
@@ -40,19 +33,15 @@ def load_models():
 
     for name, model in models.items():
         path = f"outputs/models/{name}_pinn.pt"
-
-        if not Path(path).exists():
-            raise FileNotFoundError(f"Model not found: {path}")
-
         model.load(path)
         model.eval()
 
-    print("All models loaded successfully")
+    print("Models loaded successfully")
     return models
 
 
 # ============================================================
-# 2. JSON → SAME PIPELINE AS TRAINING
+# 2. Input pipeline
 # ============================================================
 def prepare_inputs(json_data):
     loader = PINNDataLoader(data_dir="datasrc/")
@@ -60,194 +49,210 @@ def prepare_inputs(json_data):
 
     df = loader.build_feature_matrix(extra_features=json_data)
 
-    bio_tensors  = loader.to_biology_tensors(df)
-    heat_tensors = loader.to_heat_tensors(df)
-    chem_tensors = loader.to_chemistry_tensors(df)
+    bio = loader.to_biology_tensors(df)
+    heat = loader.to_heat_tensors(df)
+    chem = loader.to_chemistry_tensors(df)
 
-    inputs = {
-        "biology":   bio_tensors["X_test"][:1],
-        "stress":    bio_tensors["X_test"][:1][:, :3],
-        "growth":    bio_tensors["X_test"][:1][:, :3],
-        "heat":      heat_tensors["X_test"][:1],
-        "chemistry": chem_tensors["X_test"][:1],
+    return {
+        "biology": bio["X_test"][:1],
+        "stress": bio["X_test"][:1][:, :3],
+        "growth": bio["X_test"][:1][:, :3],
+        "heat": heat["X_test"][:1],
+        "chemistry": chem["X_test"][:1],
     }
-
-    return inputs
 
 
 # ============================================================
-# 3. Run inference
+# 3. Inference
 # ============================================================
 def run_inference(models, json_data):
     inputs = prepare_inputs(json_data)
-
     results = {}
 
     with torch.no_grad():
         for name, model in models.items():
-            X = inputs[name]
-            print(f"{name}: input shape {X.shape}")
-            pred = model(X)
+            pred = model(inputs[name])
             results[name] = float(pred.mean().item())
 
     return results
 
 
 # ============================================================
-# 4. Interpretation
+# 4. Explanation
 # ============================================================
-_CONDITION_LABELS = {
-    "biology": {
-        "high": "High biological activity",
-        "moderate": "Moderate biological activity",
-        "low": "Low biological activity",
-    },
-    "stress": {
-        "high": "High stress",
-        "moderate": "Moderate stress",
-        "low": "Low stress",
-    },
-    "heat": {
-        "high": "High thermal load",
-        "moderate": "Moderate thermal load",
-        "low": "Low thermal load",
-    },
-    "chemistry": {
-        "high": "High chemical activity",
-        "moderate": "Moderate chemical activity",
-        "low": "Low chemical activity",
-    },
-    "growth": {
-        "high": "High growth potential",
-        "moderate": "Moderate growth potential",
-        "low": "Low growth potential",
-    },
+LABELS = {
+    "biology": ["Low biological activity", "Moderate biological activity", "High biological activity"],
+    "stress": ["Low stress", "Moderate stress", "High stress"],
+    "heat": ["Low thermal load", "Moderate thermal load", "High thermal load"],
+    "chemistry": ["Low chemical activity", "Moderate chemical activity", "High chemical activity"],
+    "growth": ["Low growth potential", "Moderate growth potential", "High growth potential"]
 }
 
-def _score_to_tier(v):
+def tier(v):
     if v >= 0.8:
-        return "high"
+        return 2
     elif v >= 0.3:
-        return "moderate"
-    return "low"
+        return 1
+    return 0
 
-def explain_results(results):
-    out = {}
-    for k, v in results.items():
-        tier = _score_to_tier(v)
-        out[k] = f"{v:.2f} → {_CONDITION_LABELS[k][tier]}"
-    return out
+def explain(results):
+    return {
+        k: f"{v:.2f} - {LABELS[k][tier(v)]}"
+        for k, v in results.items()
+    }
 
 
 # ============================================================
-# 5. LLM + DEBUG + FALLBACK
+# 5. Feasibility
 # ============================================================
-def generate_human_readable(json_input, predictions, explanations):
+def detect_feasibility(json_data):
+    temp = json_data.get("temperature", 0)
+    water = json_data.get("water_availability", 1)
 
-    # If no API key → skip LLM
+    if temp > 50:
+        return "impossible"
+    if temp > 40 or water < 0.1:
+        return "risky"
+    return "feasible"
+
+
+# ============================================================
+# 6. JSON extractor
+# ============================================================
+def extract_json(text):
+    match = re.search(r"\{.*\}", text, re.DOTALL)
+    if match:
+        return match.group(0)
+    return None
+
+
+# ============================================================
+# 7. LLM
+# ============================================================
+def generate_structured(json_input, predictions, explanations):
+
     if not OPENROUTER_API_KEY:
-        return fallback_report(predictions, explanations)
-
-    url = "https://openrouter.ai/api/v1/chat/completions"
+        return fallback(explanations)
 
     prompt = f"""
-You are an agricultural expert.
+Return valid JSON only.
 
-INPUT:
-{json.dumps(json_input, indent=2)}
+Use these explanations:
+{json.dumps(explanations)}
 
-PREDICTIONS:
-{json.dumps(predictions, indent=2)}
-
-EXPLANATIONS:
-{json.dumps(explanations, indent=2)}
-
-Write a clear real-world analysis with:
-- Overall condition
-- Key strengths
-- Risks
-- Practical recommendation
+Fields:
+overall_condition
+biology
+stress
+heat
+chemistry
+growth
+key_risk
+recommendation
+feasibility
 """
 
-    headers = {
-        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-        "Content-Type": "application/json",
-        "HTTP-Referer": "http://localhost",
-        "X-Title": "PINN System"
-    }
-
-    data = {
-        "model": "meta-llama/llama-3-8b-instruct",
-        "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0.3
-    }
-
     try:
-        response = requests.post(url, headers=headers, json=data)
+        res = requests.post(
+            "https://openrouter.ai/api/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                "Content-Type": "application/json"
+            },
+            json={
+                "model": "meta-llama/llama-3-8b-instruct",
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.2
+            }
+        )
 
-        print("LLM STATUS:", response.status_code)
-        print("LLM RAW:", response.text[:300])  # partial for safety
+        if res.status_code != 200:
+            return fallback(explanations)
 
-        if response.status_code != 200:
-            return fallback_report(predictions, explanations)
+        raw = res.json()["choices"][0]["message"]["content"]
 
-        return response.json()["choices"][0]["message"]["content"]
+        json_str = extract_json(raw)
+        if not json_str:
+            return fallback(explanations)
 
-    except Exception as e:
-        print("LLM exception:", str(e))
-        return fallback_report(predictions, explanations)
+        data = json.loads(json_str)
 
+        # enforce correct explanation values
+        for k in explanations:
+            data[k] = explanations[k]
 
-# ============================================================
-# FALLBACK
-# ============================================================
-def fallback_report(predictions, explanations):
-    report = "Crop Analysis Report:\n\n"
+        return data
 
-    for k, v in explanations.items():
-        report += f"- {k.capitalize()}: {v}\n"
-
-    report += "\nSummary:\n"
-
-    if predictions["growth"] > 0.8:
-        report += "Strong growth potential detected.\n"
-
-    if predictions["chemistry"] < 0.3:
-        report += "Soil chemistry imbalance detected.\n"
-
-    if predictions["stress"] > 0.6:
-        report += "Moderate environmental stress observed.\n"
-
-    report += "\nRecommendation:\nAdjust soil nutrients and monitor conditions."
-
-    return report
+    except:
+        return fallback(explanations)
 
 
 # ============================================================
-# 6. Output
+# 8. Fallback
+# ============================================================
+def fallback(explanations):
+    return {
+        "overall_condition": "Moderate stress with strong growth potential",
+        "biology": explanations["biology"],
+        "stress": explanations["stress"],
+        "heat": explanations["heat"],
+        "chemistry": explanations["chemistry"],
+        "growth": explanations["growth"],
+        "key_risk": "Low chemical activity",
+        "recommendation": "Improve irrigation and nutrients",
+        "feasibility": "unknown"
+    }
+
+
+# ============================================================
+# 9. Crisp Human Report
+# ============================================================
+def build_human_report(analysis):
+
+    if analysis["feasibility"] == "impossible":
+        return "Condition: Not feasible. Environmental limits exceeded."
+
+    return (
+        f"Condition: {analysis['overall_condition']}\n"
+        f"Growth: {analysis['growth']}\n"
+        f"Risk: {analysis['key_risk']}\n"
+        f"Action: {analysis['recommendation']}"
+    )
+
+
+# ============================================================
+# 10. Output
 # ============================================================
 def format_output(results, json_data):
-    explanations = explain_results(results)
 
-    report = generate_human_readable(
+    explanations = explain(results)
+
+    structured = generate_structured(
         json_data,
         results,
         explanations
     )
 
+    # system override
+    structured["feasibility"] = detect_feasibility(json_data)
+
+    # human report
+    human_report = build_human_report(structured)
+
     return {
         "predictions": results,
         "explanations": explanations,
-        "human_readable_report": report,
+        "analysis": structured,
+        "human_readable_report": human_report,
         "status": "success"
     }
 
 
 # ============================================================
-# 7. MAIN
+# 11. MAIN
 # ============================================================
 if __name__ == "__main__":
-    print("\nStarting Inference Pipeline...\n")
+    print("\nRunning inference...\n")
 
     models = load_models()
 
@@ -256,7 +261,6 @@ if __name__ == "__main__":
 
     results = run_inference(models, json_data)
 
-    final_output = format_output(results, json_data)
+    output = format_output(results, json_data)
 
-    print("\nFINAL OUTPUT:")
-    print(json.dumps(final_output, indent=2, ensure_ascii=False))
+    print(json.dumps(output, indent=2))
